@@ -8,7 +8,7 @@
 #          of CESI drought/dry year indicator.
 #
 #  Environment and Climate Change Canada
-#  Created: August 2022
+#  Created: November 2022
 #
 #######################################################################
 
@@ -18,7 +18,10 @@
 # Different methodologies are used for perennial and intermittent
 # watercourses, but both involve defining a station-specific threshold
 # and comparing the yearly summer data to the threshold.
-# Kriged maps and trends over 50 years are calculated with the results.
+# Trends over 50 years are calculated with the results and a kriged
+# pan-Canadian map is created for the trends using regional kriging. Five
+# grouped ecozones are used as regions because they can be expected to have
+# similar drought responses.
 # The specific steps are:
 #    1) Define variables
 #    2) Create tables to compile results
@@ -33,13 +36,20 @@
 #       i. calculate dry spell durations
 #      ii. define threshold from cumulative distribution of dry spell duration
 #     iii. evaluate each year against threshold
-#    7) Identify trends using logistic regression
+#    7) Identify 50-year trends using 4 tests: hurdle, negative binomial, Wald-
+#         Wolfowitz and all zeros
 #    8) Save output as csv files
-#    9) Krige results into pan-Canadian maps
+#    9) Krige results and create pan-Canadian map
 
-# Assuming there are three sub-folders in working directory: "Dependencies"
-# (with files for station list [RHBN_U.csv] and country boundaries
-# [CanadaBound.shp]), "Output" (in which to save the output), and "R" (in which
-# 2 script files are located [CESI hydrological drought.R-THIS ONE] and
-# [CESI hydrological drought-functions.R])
+# Assuming there are three sub-folders in working directory: 
+# 1. "Dependencies" - with following files
+#             station list [RHBN_U.csv]
+#             country boundaries [CanadaBound.shp]
+#             kriging zones [5 merged ecozones.shp]
+#             outlines of big lakes [CANwaterbodies.shp]
+#             CESI north arrow [esri6north.png]
+# 2. "Output" - in which to save the output
+# 3. "R" - in which 2 script files are located:
+#             [CESI hydrological drought.R-THIS ONE]
+#             [CESI hydrological drought-functions.R]
 #######################################################################

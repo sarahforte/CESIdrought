@@ -7,7 +7,7 @@
 #          of CESI drought/dry year indicator.
 #
 #  Environment and Climate Change Canada
-#  Created: August 2022
+#  Created: November 2022
 #
 #######################################################################
 
@@ -17,7 +17,10 @@
 # Different methodologies are used for perennial and intermittent
 # watercourses, but both involve defining a station-specific threshold
 # and comparing the yearly summer data to the threshold.
-# Kriged maps and trends over 50 years are calculated with the results.
+# Trends over 50 years are calculated with the results and a kriged
+# pan-Canadian map is created for the trends using regional kriging. Five
+# grouped ecozones are used as regions because they can be expected to have
+# similar drought responses.
 # The specific steps are:
 #    1) Define variables
 #    2) Create tables to compile results
@@ -27,32 +30,45 @@
 #    6A) For perennial watercourses:
 #       i. calculate rolling average
 #      ii. define threshold by fitting curve to 30-year reference data
-#     iii. evaluate each year against threshold
+#     iii. find droughts using threshold while pooling adjacent events and
+#            eliminating short events
 #    6B) For intermittent watercourses:
 #       i. calculate dry spell durations
 #      ii. define threshold from cumulative distribution of dry spell duration
 #     iii. evaluate each year against threshold
-#    7) Identify 50-year trends using logistic regression
+#    7) Identify 50-year trends using 4 tests: hurdle, negative binomial, Wald-
+#         Wolfowitz and all zeros
 #    8) Save output as csv files
-#    9) Krige results into pan-Canadian maps
-#   10) Determine 50-year trends with logistical regression
+#    9) Krige results and create pan-Canadian map
 
-# Assuming there are three sub-folders in working directory: "Dependencies"
-# (with files for station list [RHBN_U.csv] and country boundaries
-# [CanadaBound.shp]), "Output" (in which to save the output), and "R" (in which
-# 2 script files are located [CESI hydrological drought.R-THIS ONE] and
-# [CESI hydrological drought-functions.R])
+# Assuming there are three sub-folders in working directory: 
+# 1. "Dependencies" - with following files
+#             station list [RHBN_U.csv]
+#             country boundaries [CanadaBound.shp]
+#             kriging zones [5 merged ecozones.shp]
+#             outlines of big lakes [CANwaterbodies.shp]
+#             CESI north arrow [esri6north.png]
+# 2. "Output" - in which to save the output
+# 3. "R" - in which 2 script files are located:
+#             [CESI hydrological drought.R-THIS ONE]
+#             [CESI hydrological drought-functions.R]
 #######################################################################
 
 # load necessary libraries
 library(tidyhydat) # for interacting with hydat database
 library(lfstat)    # for fitting curves to low flow statistics
-library(sp) # to create spatial objects
-library(rgdal) # read vector maps into spatial objects
-library(automap) # to model variogram
-library(gstat)  # for Kriging
-library(raster) # processing spatial raster data. !!!overwrites dplyr::select!!!
+library(purrr)     # function 'possibly' is easiest way to deal with errors
+library(MASS)      # for function in Negative Binomial & hurdle tests
+library(countreg)  # for hurdle test
+library(trend)     # for wald-wolfowitz stationarity test
+library(sp)        # to create spatial objects
+library(rgdal)     # read vector maps into spatial objects
+library(automap)   # to model variogram
+library(gstat)     # for Kriging
+library(raster)    # processing spatial raster data. !!!overwrites dplyr::select!!!
+library(rgeos)     # for buffer functions on shape files
 library(dplyr)     # for data tidying and data tables
+library(png)       # to import image
 
 source('./R/CESI hydrological drought-functions.R')
 
@@ -65,7 +81,6 @@ return.freq <- 5 #return frequency in years for n.day average
 perc <- 0.9 #percentile for threshold dry spell duration
 summer.beg <- "05-01" #first day of summer period
 summer.end <- "10-01" #last day of summer period
-map.years <- c(2000:2019) #range of years for output maps
 
 
 ######### STEP 2) Create tables #########
@@ -73,18 +88,11 @@ threshold.per <- data.frame(STATION_NUMBER=NA, censored=NA, freq0=NA,
                     best.dist=NA, R2=NA,param1=NA, param2=NA, param3=NA,
                     ret.freq.flow=NA)
 threshold.int <- data.frame(STATION_NUMBER=NA, duration=NA)
-
-drought.per <- data.frame(STATION_NUMBER=NA, Year=NA, win_min=NA,
-                  d.less.ret.flow=NA, flag=NA)
-drought.int <- data.frame(STATION_NUMBER=NA, Year=NA, dr_events=NA, flag=NA)
-drought <- data.frame(matrix(ncol=2+length(yrs.of.int), nrow=nrow(stations)))
-colnames(drought) <- c("STATION_NUMBER", "type", yrs.of.int)
-drought$STATION_NUMBER <- stations$STATION_NUMBER
-
-log.reg <- data.frame(matrix(ncol=6, nrow=nrow(stations)))
-colnames(log.reg) <- c("STATION_NUMBER", "slope", "intercept", "R2", "p", "significant")
-log.reg$STATION_NUMBER <- stations$STATION_NUMBER
-
+drought <- data.frame(STATION_NUMBER=NA, type= NA, year=NA, dr_events=NA,
+                      dr_max_dur=NA, dr_days=NA)
+trends <- data.frame(STATION_NUMBER=stations$STATION_NUMBER, type= NA,
+                     hurdlechk=NA, slope=NA, intercept=NA, CATTrend=NA, 
+                     years.for.trend=NA, test=NA, mapslope=NA)
 
 ######### STEP 3) Retrieve hydrometric data #########
 for (j in 1:length(stations$STATION_NUMBER)) { #start loop that cycles through each station
@@ -166,35 +174,37 @@ for (j in 1:length(stations$STATION_NUMBER)) { #start loop that cycles through e
     curve.data <- ret.freq.curve(return.freq, averages[,c(1,ncol(averages))], ref_years)
     threshold.per[nrow(threshold.per)+1,] <- c(stations$STATION_NUMBER[j], curve.data)
 
-#----- iii. evaluate which years have average minimum flows below the threshold -----
-    if (!is.na(curve.data[8])) { #only evaluate if there is a threshold
-      # identify stations with thresholds as perennial
-      drought$type[j] <- "perennial"
-      # number of days below
-      d.less.ret.flow <- rowSums(averages[,c(-1,-ncol(averages))]<as.numeric(curve.data[8]),
-                           na.rm=TRUE)
-      # flag for at least one period below return flow
-      less.ret.flow <- ifelse(d.less.ret.flow>0, 1, 0)
-
-      # Add station data to both detailed and general compilation tables
-      drought.per[(nrow(drought.per)+1):(nrow(drought.per)+len.v.year),] <-
-        data.frame(rep(stations$STATION_NUMBER[j],len.v.year), valid_year,
-                   averages$ann.min, d.less.ret.flow, less.ret.flow)
-      drought[j,which(names(drought) %in% valid_year)] <- less.ret.flow
-    }
-
+#----- iii. use function from lfstat library to calculate drought events -----
+    if ((curve.data[1]==FALSE | curve.data[1]==0) & !is.na(curve.data[8]) & curve.data[8]>=0.001) { # if there is a threshold above detection limit, identify stations as perennial
+      trends$type[j] <- "perennial"
+      for (k in 1:len.v.year) { #cycle through all the years for that station
+        if (sum(!is.na(flow.summer[k,-1]))>60) { #only do years with at least 60 calculated averages
+          data.s <- data.frame(day=substr(days,4,5), month=substr(days,1,2), 
+              year=rep(flow.summer[k,1],154), flow=as.numeric(flow.summer[k,-1]))
+          
+          y_dr <- drought_days(data=data.s, dr_thresh=as.numeric(curve.data[8]),
+                               stn=stations$STATION_NUMBER[j])
+        } else { # for those years with insufficient data
+          y_dr <- data.frame(dr_events=NA, dr_max_dur=NA, dr_days=NA)
+        }
+        
+        # add results for that station to table
+        y_dr <- merge(data.frame(STATION_NUMBER=stations$STATION_NUMBER[j],
+                    type="perennial", year=valid_year[k]), y_dr)
+        drought <- rbind(drought, y_dr)
+      } # close loop for all years at that station
+    } # close loop for perennial stations (those for which a curve could be calculated)
+      
 
 ######### STEP 6B) For intermittent watercourses: #########
-    # Identify hydrometric stations on intermittent watercourses as those that:
+    # Identify hydrometric stations on intermittent watercourses as any of those that:
     #     1) have more than 25% annual n-day minima as 0 during 30 reference
-    #          years (censored=TRUE)
-    #     2) have a return flow frequency of less than 0.001 m3/s (detection limit)
+    #          years (censored=TRUE);
+    #     2) have a return flow frequency of less than 0.001 m3/s (detection limit); or
     #     3) do not have a calculated return frequency flow.
-    if (curve.data[1]==TRUE & (is.na(curve.data[8]) | curve.data[8]<0.001)) {
-      # flag station as intermittent
-      drought$type[j] <- "intermittent"
-
-#----- i. calculate dry spell durations  -----
+    if (curve.data[1]==TRUE | curve.data[1]==1 | curve.data[8]<0.001 | is.na(curve.data[8])) {
+      trends$type[j] <- "intermittent" # flag station as intermittent
+      #----- i. calculate dry spell durations  -----
       no.flow.spells <- data.frame(matrix(ncol=79,nrow=len.v.year)) #number of columns is max possible number of dry spells (total summer days/2) + 1
       no.flow.spells[,1] <- valid_year
 
@@ -236,51 +246,56 @@ for (j in 1:length(stations$STATION_NUMBER)) { #start loop that cycles through e
 
 #----- iii. evaluate each year against threshold  -----
         events <- rowSums(no.flow.spells[,-1]>Th, na.rm=TRUE)
-        # flag for at least one period below return flow
-        dry <- ifelse(events>0, 1, 0)
-        # Add station data to both detailed and general compilation tables
-        drought.int[(nrow(drought.int)+1):(nrow(drought.int)+len.v.year),] <-
-          data.frame(rep(stations$STATION_NUMBER[j],len.v.year), valid_year, events, dry)
-        drought[j,which(names(drought) %in% valid_year)] <- dry
+        most <- max(events)
+        if (most == 0) {
+          days.above <- rep(0, length(events))
+          longest.above <- rep(0, length(events))
+        } else {
+          dry <- data.frame(matrix(nrow=length(events), ncol=most))
+          for (i in 1:length(events)) {
+            if (events[i]>0) {
+              dry[i,] <- no.flow.spells[i,which(no.flow.spells[i,-1]>Th)+1]-Th
+              if (events[i]==1 & most>1) {dry[i,2:most] <- NA}
+              if (events[i]==2 & most>2) {dry[i,3:most] <- NA}
+            }
+          }
+          days.above <- rowSums(dry, na.rm=TRUE)
+          longest.above <- do.call(pmax, c(dry, na.rm=TRUE))
+        }
+        
+        # add results for that station to table
+        drought <- rbind(drought, data.frame(STATION_NUMBER=rep(stations$STATION_NUMBER[j],
+                      len.v.year), type=rep("intermittent", len.v.year), year=valid_year,
+                      dr_events=events, dr_max_dur=longest.above, dr_days=days.above))
       } #close loop for intermittent stations with threshold
     } # close loop for all intermittent stations
-    print(drought$type[j])
 
+    
 ######### STEP 7) Identify 50-year trends #########
-    # Since results are a binary presence/absence, use logistic regression to test
-    # for trends - whether the presence of droughts is increasing or decreasing
-    # check if there is sufficient data to calculate a trend
-    # minimum requirements: some data 1970-1975, >=30 points & no gap over 10 years
-    data <- drought[j,(which(!is.na(drought[j,3:52]))+2)] #use the presence/absence data for station
-    goodyears <- as.numeric(names(data)) #find which years have data
+    # Look for trends using 3 tests, when possible a hurdle test for those series
+    # with 3 or more zeros, a negative binomial test otherwise, and finally a
+    # stationarity check using all zeros or Wald-Wolfowitz test
+    ## Minimum data requirements: some data 1970-1975, >=30 points & no gap over 10 years
+    data <- drought %>% filter(drought$STATION_NUMBER==stations$STATION_NUMBER[j]) %>%
+                select(year, dr_days) %>% na.omit()
+    goodyears <- data$year #find which years have data
     gap.check <- na.omit(goodyears - lag(goodyears)) #check for holes in data continuity
     if (all(any(goodyears %in% c(1970:1975)), (length(goodyears) >= 30),
             (max(gap.check) <= 11))){
-      # calculate regression as a generalized linear model of binomial family
-      logistic <- glm(as.numeric(data) ~ goodyears,data,family=binomial)
-      # Extract model results
-      coeff <- logistic$coefficients[c(2,1)]
-      ll.null <- logistic$null.deviance/-2
-      ll.proposed <- logistic$deviance/-2
-      R2 <- (ll.null-ll.proposed)/ll.null
-      p <- 1-pchisq(2*(ll.proposed-ll.null),df=(length(logistic$coefficients)-1))
-      significant <- case_when(p<=0.05 ~ TRUE,
-                               p>0.05 ~ FALSE,
-                               is.na(p) ~ NA)
-      # Add station data to both detailed and general compilation tables
-      log.reg[j,2:6] <- c(coeff, R2, p, significant)
+      # calculate trends
+      trends[j,3:9] <- identify_trends(data=data)
     }
   } #close loop for calculations on those stations which have sufficient data
 } #close loop cycling through all the stations
 
+# remove one spurious trends at station 06AG001
+trends$mapslope[574] <- NA
 
 ######### STEP 8) Save output as csv files #########
-# delete the first row of the threshold tables and two detailed drought tables
-# as they will be NA
+# delete the first row of the threshold tables and drought tables as they will be NA
 threshold.per <- threshold.per[-1,]
 threshold.int <- threshold.int[-1,]
-drought.per <- drought.per[-1,]
-drought.int <- drought.int[-1,]
+drought <- drought[-1,]
 # harmonize TRUE/FALSE entries
 threshold.per$censored[threshold.per$censored==0] <- FALSE
 threshold.per$censored[threshold.per$censored==1] <- TRUE
@@ -288,13 +303,16 @@ threshold.per$censored[threshold.per$censored==1] <- TRUE
 # then write all the files, omitting the row numbers
 write.csv(threshold.per, "./Output/CESIdrought-perennial thresholds.csv", row.names = FALSE)
 write.csv(threshold.int, "./Output/CESIdrought-intermittent thresholds.csv", row.names = FALSE)
-write.csv(drought.per, "./Output/CESIdrought-perennial drought.csv", row.names = FALSE)
-write.csv(drought.int, "./Output/CESIdrought-intermittent drought.csv", row.names = FALSE)
-write.csv(drought, "./Output/CESIdrought-drought presence-absence.csv", row.names = FALSE)
-write.csv(log.reg, "./Output/CESIdrought-logistic.regression.csv", row.names = FALSE)
+write.csv(drought, "./Output/CESIdrought- drought.csv", row.names = FALSE)
+write.csv(trends, "./Output/CESIdrought- trends.csv", row.names = FALSE)
 
 
-######### STEP 9) Krige results into pan-Canadian maps #########
-pan.can.krige(drought, map.years, "./Dependencies", "./Output/CESI drought 2000-2019.pdf")
+######### STEP 9) Krige results and produce map #########
+surface <- krige_data(data.t=trends[which(!is.na(trends$mapslope)),c(1,9)],
+                      output.name="variogram")
+
+map_results(input=surface, echelle=0.4, divisions=8,
+            leg.title="Trends in abnormally-low flow days\n[days/year]", 
+            output.name="CESIdrought - map of trends", type="PNG")
 
 
